@@ -6,6 +6,10 @@ from transformer import *
 from torchtext import data, datasets
 from collections import OrderedDict as OD
 
+# enable random autoregressive masks
+USE_RANDOM_AR_MASKS = True
+
+
 # reproducibility
 torch.manual_seed(2)
 np.random.seed(2)
@@ -29,7 +33,7 @@ def build_ar_masks(lens):
     masks = []
     for len_ in lens:
         arr = np.arange(len_)
-        np.random.shuffle(arr)
+        if USE_RANDOM_AR_MASKS : np.random.shuffle(arr)
         
         rev = [arr[arr[j]] for j in range(len_)]
         mask = np.zeros((len_, len_))
