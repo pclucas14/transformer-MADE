@@ -3,6 +3,7 @@ import pdb
 import numpy as np
 import torch
 from transformer import * 
+from utils import * 
 from torchtext import data, datasets
 from collections import OrderedDict as OD
 
@@ -28,35 +29,6 @@ print('number of params', sum([np.prod([int(y) for y in x.shape]) for x in gen.p
 
 # build optimizer
 optimizer_gen = torch.optim.Adam(gen.parameters())
-
-def build_ar_masks(lens):
-    masks = []
-    for len_ in lens:
-        arr = np.arange(len_)
-        if USE_RANDOM_AR_MASKS : np.random.shuffle(arr)
-        
-        rev = [arr[arr[j]] for j in range(len_)]
-        mask = np.zeros((len_, len_))
-        for j, row in enumerate(mask[:len_]): 
-            # row[i] = 1
-            # find index with i
-            index = np.where(arr == j)[0][0]
-            row[arr[:index]] = 1
-
-        mask = mask + np.eye(mask.shape[0])
-        mask[len_:, len_:] = 0
-
-        masks += [mask]
-
-    return np.stack(masks)
-    
-def print_scalar(name, value, write_no, end_token=''):
-    if isinstance(value, list):
-        if len(value) == 0: return 
-        value = torch.mean(torch.stack(value))
-    zeros = 40 - len(name) 
-    name += ' ' * zeros
-    print('{} @ write {} = {:.4f}{}'.format(name, write_no, value, end_token))
 
 
 def full_epoch(epoch_no, split):
