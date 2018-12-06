@@ -22,23 +22,25 @@ for i in range(tries):
     mask  = masks[[i]] # make_std_mask(input, 999) #masks[[i]]
 
     # -----------------------------------------------------------------------------------
-    # We first test if the dependancy given by the mask is enforced in the fwd/bwd pass
+    # We first test if the dependency given by the mask is enforced in the fwd/bwd pass
     # -----------------------------------------------------------------------------------
 
     for t in range(input.size(1)):
         model.zero_grad()
         out = model(input, mask) * 1000
         loss = out[:, t].sum().backward()
+        test = model.tgt_embed[0].lut.weight.grad 
         depends = (model.tgt_embed[0].lut.weight.grad != 0).byte()
         depends = depends.sum(dim=1)
         depends = depends > 0
         
         if (depends != mask[0, t]).sum() > 0:
-            raise ValueError('Mask dependancy is not being enforced')
+            raise ValueError('Mask dependency is not being enforced')
     
     # -----------------------------------------------------------------------------------
     # Next, we test if the mask is actually autoregressive
     # -----------------------------------------------------------------------------------
+    
     mask = mask.squeeze()
     depends = []
 
@@ -57,10 +59,9 @@ for i in range(tries):
         prev_deps = [int(x) for x in depends[order[i-1]].squeeze(0)]
         curr_deps = [int(x) for x in depends[order[i]].squeeze(0)]
         
-        # previous list of dependancy sould equal the current one, minus the self dependancy
+        # previous list of dependency sould equal the current one, minus the self dependency
         prev_deps += [int(current_index)]
     
         if sorted(prev_deps) != sorted(curr_deps):
-            import pdb; pdb.set_trace()
             raise ValueError('Ordering is breaking autoregressive property')
 
