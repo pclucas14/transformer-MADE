@@ -101,16 +101,12 @@ class DecoderLayer(nn.Module):
         self.size = size
         self.self_attn = self_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 2) #3)
-        # self.mix = nn.Linear(2*size, size)
+        self.sublayer = clones(SublayerConnection(size, dropout), 2) 
  
     def forward(self, x, inp_mask, target_pos_embeddings=None):
         "Follow Figure 1 (right) for connections."
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, inp_mask, trg_pos_embed=target_pos_embeddings))
-        # x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
         if target_pos_embeddings is not None:
-            #gate = F.sigmoid(self.mix(torch.cat([x, target_pos_embeddings], dim=-1)))
-            #x = x * gate + target_pos_embeddings * (1 - gate)
             x += target_pos_embeddings
 
         return self.sublayer[1](x, self.feed_forward)
@@ -159,13 +155,6 @@ class MultiHeadedAttention(nn.Module):
         query, key, value = \
             [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
              for l, x in zip(self.linears, (query, key, value))]
-
-        # Add some positional target info in the query
-        '''
-        if trg_pos_embed is not None:
-            trg_pos_embed = trg_pos_embed[:, :, ::self.h].unsqueeze(1)
-            query += trg_pos_embed
-        '''
 
         # 2) Apply attention on all the projected vectors in batch. 
         x, self.attn = attention(query, key, value, mask=mask, 
