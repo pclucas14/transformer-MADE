@@ -18,20 +18,23 @@ class EncoderDecoder(nn.Module):
     A standard Encoder-Decoder architecture. Base for this and many 
     other models.
     """
-    def __init__(self, decoder, tgt_embed, generator):
+    def __init__(self, decoder, inp_embed, generator, pos_embed):
         super(EncoderDecoder, self).__init__()
         # self.encoder = encoder
         self.decoder = decoder
-        self.tgt_embed = tgt_embed
+        self.inp_embed = inp_embed
         self.generator = generator
+        self.pos_embed = pos_embed
         
-    def forward(self, tgt, tgt_mask):
+    def forward(self, inp, inp_mask, target_pos=None):
         "Take in and process masked src and target sequences."
-        return self.generator(self.decode(tgt, tgt_mask))
+        return self.generator(self.decode(inp, inp_mask, target_pos))
     
-    def decode(self, tgt, tgt_mask):
-        tgt = self.tgt_embed(tgt)
-        return self.decoder(tgt, tgt_mask)
+    def decode(self, inp, inp_mask, target_pos):
+        inp = self.inp_embed(inp)
+        if target_pos is not None:
+            target_pos = self.pos_embed(inp, pos_only=True, trg_pos=target_pos)
+        return self.decoder(inp, inp_mask, target_pos)
 
 
 class Generator(nn.Module):
@@ -85,9 +88,9 @@ class Decoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = LayerNorm(layer.size)
         
-    def forward(self, x, tgt_mask):
+    def forward(self, x, inp_mask, target_pos_embeddings):
         for layer in self.layers:
-            x = layer(x, tgt_mask)
+            x = layer(x, inp_mask, target_pos_embeddings=target_pos_embeddings)
         return self.norm(x)
 
 
@@ -99,11 +102,17 @@ class DecoderLayer(nn.Module):
         self.self_attn = self_attn
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 2) #3)
+        # self.mix = nn.Linear(2*size, size)
  
-    def forward(self, x, tgt_mask):
+    def forward(self, x, inp_mask, target_pos_embeddings=None):
         "Follow Figure 1 (right) for connections."
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, inp_mask, trg_pos_embed=target_pos_embeddings))
         # x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        if target_pos_embeddings is not None:
+            #gate = F.sigmoid(self.mix(torch.cat([x, target_pos_embeddings], dim=-1)))
+            #x = x * gate + target_pos_embeddings * (1 - gate)
+            x += target_pos_embeddings
+
         return self.sublayer[1](x, self.feed_forward)
 
 
@@ -139,7 +148,7 @@ class MultiHeadedAttention(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
         
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, trg_pos_embed=None):
         "Implements Figure 2"
         if mask is not None:
             # Same mask applied to all h heads.
@@ -150,7 +159,14 @@ class MultiHeadedAttention(nn.Module):
         query, key, value = \
             [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
              for l, x in zip(self.linears, (query, key, value))]
-        
+
+        # Add some positional target info in the query
+        '''
+        if trg_pos_embed is not None:
+            trg_pos_embed = trg_pos_embed[:, :, ::self.h].unsqueeze(1)
+            query += trg_pos_embed
+        '''
+
         # 2) Apply attention on all the projected vectors in batch. 
         x, self.attn = attention(query, key, value, mask=mask, 
                                  dropout=self.dropout)
@@ -199,10 +215,17 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
         
-    def forward(self, x):
-        x = x + Variable(self.pe[:, :x.size(1)], 
-                         requires_grad=False)
+    def forward(self, x, pos_only=False, trg_pos=None):
+        pos = Variable(self.pe[:, :x.size(1)], requires_grad=False)
+        if not pos_only:
+            x = x + pos
+        else:
+            assert trg_pos is not None
+            trg_pos_embed = torch.index_select(pos, 1, trg_pos.flatten())
+            trg_pos_embed = trg_pos_embed.view(trg_pos.size(0), trg_pos.size(1), pos.size(-1))
+            x = trg_pos_embed
         return self.dropout(x)
+
 
 
 def make_model(tgt_vocab, N=6, 
@@ -216,7 +239,7 @@ def make_model(tgt_vocab, N=6,
         Decoder(DecoderLayer(d_model, c(attn), 
                              c(ff), dropout), N),
         nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
-        Generator(d_model, tgt_vocab))
+        Generator(d_model, tgt_vocab), c(position))
     
     # This was important from their code. 
     # Initialize parameters with Glorot / fan_avg.
@@ -233,17 +256,78 @@ def make_std_mask(tgt, pad):
         subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data))
     return tgt_mask
 
+# Layers
+# ------------------------------------------------------------------------------------
+''' Neat way of doing  ResNet while changing the dimension of the representation'''
+class GatedDense(nn.Module):
+    def __init__(self, input_size, output_size, activation=None):
+        super(GatedDense, self).__init__()
 
-def greedy_decode(model, max_len, start_symbol=2):
+        self.activation = activation
+        self.sigmoid = nn.Sigmoid()
+        self.h = nn.Linear(input_size, output_size)
+        self.g = nn.Linear(input_size, output_size)
+
+    def forward(self, x):
+        h = self.h(x)
+        if self.activation is not None:
+            h = self.activation(h)
+
+        g = self.sigmoid(self.g(x))
+
+        return h * g
+
+
+
+# Sampling
+# ------------------------------------------------------------------------------------
+
+def greedy_decode(model, max_len, start_symbol=2, take_max=False):
     ys = torch.ones(1, 1).fill_(start_symbol).long().cuda()
     for i in range(max_len-1):
         out = model.decode(
-                           ys, 
-                           (subsequent_mask(ys.size(1)).type_as(ys)))
+                           ys,
+                           (subsequent_mask(ys.size(1)).type_as(ys)), target_pos=None)
         prob = model.generator(out[:, -1])
-        import pdb; pdb.set_trace()	
-        _, next_word = torch.max(prob, dim = 1)
+        if take_max:
+            _, next_word = torch.max(prob, dim = 1)
+        else:
+            dist = torch.distributions.Categorical(prob.exp())
+            next_word = dist.sample()
         next_word = next_word.data[0]
-        ys = torch.cat([ys, 
-                        torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=1)
+        ys = torch.cat([ys,
+                        torch.ones(1, 1).long().fill_(next_word).cuda()], dim=1)
+        ys = ys.cuda()
     return ys
+
+
+def low_entropy_decoding(model, max_len, sos_token, pad_token):
+    ys = torch.ones(1, max_len).fill_(pad_token).long().cuda()
+    ys[0, 0] = sos_token
+
+    mask = torch.zeros(1, max_len, max_len).byte().cuda()
+    
+    # all tokens can look at the sos token
+    mask[:, :, 0] = 1
+  
+    target_pos = torch.arange(max_len).unsqueeze(0).long().cuda()
+
+    for t in range(max_len):
+        out  = model.decode(ys, mask, target_pos)
+        prob = model.generator(out)
+        dist = torch.distributions.Categorical(prob.squeeze().exp())
+
+        entropies = dist.entropy()                
+        # zero-out words that have already been generated
+        mask_t = (ys != pad_token).squeeze()
+        entropies.masked_fill_(mask_t, 999999)
+
+        position = entropies.argmin()
+        sample = dist.sample()[position]
+
+        # update the mask to take into account this new word
+        mask[:, :, position] = 1
+        ys[:, position] = sample
+        
+    return ys
+    

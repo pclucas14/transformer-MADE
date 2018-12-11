@@ -7,10 +7,11 @@ from transformer import *
 from utils import * 
 from collections import OrderedDict as OD
 
-seq_len = 20
+seq_len = 10
 tries   = 300
 
 masks = torch.from_numpy(build_ar_masks([seq_len ] * tries)).byte().cuda()
+import pdb; pdb.set_trace()
 
 model = make_model(seq_len, N=2, h=4, d_model=100).cuda()
 nn.init.normal_(model.tgt_embed[0].lut.weight, 2, 2)

@@ -1,37 +1,57 @@
+import comet_ml
 import os
 import pdb
-import numpy as np
 import torch
-from transformer import * 
-from utils import * 
+import numpy as np
+from pydoc import locate
+from comet_ml import Experiment
 from torchtext import data, datasets
 from collections import OrderedDict as OD
+import matplotlib.pyplot as plti
 
-# enable random autoregressive masks
-USE_RANDOM_AR_MASKS = True
+from transformer import * 
+from models      import * 
+from utils       import * 
+from custom_ds   import *
+from args        import * 
 
+# ----------------------------------------------------------------------------------------------
+# Main file. Trying a bunch of masking techniques 
+# ----------------------------------------------------------------------------------------------
 
 # reproducibility
 torch.manual_seed(2)
 np.random.seed(2)
+args = get_args()
+print(args)
 
-# build dataset 
-train_iter, val_iter, test_iter = datasets.PennTreebank.iters(batch_size=512)
+# Build Experiment Container
+if args.log:
+    experiment = Experiment(api_key="WXSjTPlJVTQlUBN2o3O5D6Pwz", 
+                            project_name="transformer-made", 
+                            workspace="pclucas14")
+    experiment.log_parameters(vars(args))
+
+input_field, train_iter, val_iter, test_iter = load_data(path=args.data_dir, batch_size=args.batch_size)
 iterators = {'train': train_iter, 'valid': val_iter, 'test': test_iter}
 
-writes = 0
-best_valid = 1e5
+VOCAB = input_field.vocab.stoi
+VOCAB_SIZE, PAD, SOS = len(VOCAB.keys()), VOCAB['<pad>'], VOCAB['<sos>']
+best_valid = 1e10
 
 # create model and ship to GPU
-gen  = make_model(10000 + 1, N=2, h=4).cuda()
-print(gen)
+if args.model == 'transformer':
+    gen = make_model(VOCAB_SIZE, N=8, h=args.n_heads).cuda()
+else:
+    gen = RNNModel(args.model, VOCAB_SIZE, 650, 650, 650, 2).cuda()
+
+lr = args.lr
+optimizer_gen = locate('torch.optim.%s.' % args.optim)(gen.parameters(), lr=lr)
 print('number of params', sum([np.prod([int(y) for y in x.shape]) for x in gen.parameters()]))
-
-# build optimizer
-optimizer_gen = torch.optim.Adam(gen.parameters())
+print(gen)
 
 
-def full_epoch(epoch_no, split):
+def full_epoch(epoch_no, split, masking):
     loader = iterators[split]
 
     # create logging containers
@@ -43,30 +63,56 @@ def full_epoch(epoch_no, split):
 
     # Training loop
     for i, minibatch in enumerate(loader):
-       
-        input  = minibatch.text.transpose(1,0).cuda()
-        target = minibatch.target.transpose(1,0).cuda()
-        
-        bs, seq_len = input.size()
-        masks = torch.from_numpy(build_ar_masks([seq_len] * bs)).long().cuda()
-        
-        if i == 0:
-            # import pdb; pdb.set_trace()
-            print(masks[0])
+        text = minibatch.text.cuda()
+        input = text
 
-        logits = gen(input, masks)
-        recon_loss = F.cross_entropy(logits.view(bs * seq_len, -1), target.flatten())
+        if args.model == 'transformer':
+            lens = (text != 1).sum(dim=1).byte().cpu().data.numpy()
+            masks, orders, tt, _  = \
+                [torch.from_numpy(x).long().cuda() 
+                        for x in 
+                 build_ar_masks(lens, order=masking)]
+            
+            offset = (torch.arange(orders.size(0)) * (orders.size(1))).unsqueeze(1).long().cuda()
+            new_order = torch.take(input,  offset + tt)
+            target = new_order
+
+            # one token per sentence does not have a target anymore, here is the mask to mask it out
+            mask_eos = tt   != -1 # -1 was used to denote the target of the last token
+            
+            # TODO: clean masking arg handling
+            if args.mask_pad_tokens:
+                mask_pad = text != PAD
+                mask = torch.min(mask_eos, mask_pad)
+            else:
+                mask = mask_eos
+            
+            tt = tt.clamp(min=0) # turn -1s into 0s. They will be masked out during loss calculation
+             
+            # TODO: add some target information
+            logits = gen(input, masks, target_pos=tt if masking=='random' else None) 
+        
+        else:
+            # TODO: make LSTM implementation batch first
+            input = input.transpose(1,0).contiguous()
+            input, target = input[:-1], input[1:]
+            logits = gen(input)[0]
+            mask = target != PAD if args.mask_pad_tokens else torch.ones_like(target)
+
+        bs, seq_len = input.size()
+        recon_loss = F.cross_entropy(logits.view(bs * seq_len, -1), target.flatten(), reduction='none')
+        recon_loss = recon_loss.reshape(*input.size())
+        
+        # mask out the conditionals with no target and mask out the pad tokens
+        recon_loss = recon_loss * mask.float()
+        recon_loss = recon_loss.sum() / mask.sum().float()
 
         if gen.training:
              optimizer_gen.zero_grad()
              recon_loss.backward()
-             params = optimizer_gen.param_groups[0]['params']
-             torch.nn.utils.clip_grad_norm_(params, 10, norm_type=2)
+             torch.nn.utils.clip_grad_norm_(gen.parameters(), args.clip, norm_type=2)
              optimizer_gen.step()
          
-        #import pdb; pdb.set_trace()
-        #test = greedy_decode(gen, args.max_seq_len) 
-
         logs['nll']  += [recon_loss.data]
         logs['ppl']  += [recon_loss.exp().data]
 
@@ -75,41 +121,48 @@ def full_epoch(epoch_no, split):
 
 # Train / Test Loop
 # -------------------------------------------------------------------------------------
-for epoch in range(100):
-    # print('MLE pretraining epoch {}/{}'.format(epoch, args.epochs))
-    train_log = full_epoch(epoch, 'train')
+for epoch in range(args.epochs):
+    print('masking : %s' % args.masking)
+    
+    train_log = full_epoch(epoch, 'train', masking=args.masking)
 
     for key, value in train_log.items():
-        print_scalar('train/%s' % key, value, writes)
-
+        print_scalar('train/%s' % key, value, epoch)
     print('')
-    if True: #(epoch + 1) % args.test_every == 0:
-        with torch.no_grad():
-            valid_log = full_epoch(epoch, 'valid')
+    
+    with torch.no_grad():
+        valid_log = full_epoch(epoch, 'valid', masking=args.masking)
 
-            for key, value in valid_log.items():
-                print_scalar('valid/%s' % key, value, writes)
-            
-            # keep tab of best valid error in order to get legit test error:
-            curr_valid_loss = torch.stack(valid_log['nll']).mean().item()
-            if curr_valid_loss < best_valid: 
-                best_valid = curr_valid_loss
-                best_valid_epoch = epoch
-                torch.save(gen.state_dict(), 'models/gen.pth')
-            else:
-                pass
-                # lr /= args.lr_div
-                # for pg in optimizer_gen.param_groups: pg['lr'] = lr
-                # print('\n reducing lr to {} \n'.format(lr))
-                # end prematurely if learning rate is super small
-                # if lr < 1e-10 : break
-            
-    writes += 1
+        for key, value in valid_log.items():
+            print_scalar('valid/%s' % key, value, epoch)
+        print('')
 
-""" Testing Best Model """
-print('loading model with best valid loss')
-gen.load_state_dict(torch.load('models/gen.pth'))
-test_log = full_epoch(epoch, 'test')
+    if args.model == 'transformer':
+        # left to right sampling
+        left_to_right = greedy_decode(gen, 51, start_symbol=SOS)
+        ltr_str = to_readable(input_field, left_to_right)[0]
+        print('left to right : %s' % ltr_str)
 
-for key, value in test_log.items():
-    print_scalar('test/%s' % key, value, 0)
+        # low entropy sampling
+        low_entropy = low_entropy_decoding(gen, 51, SOS, PAD)
+        le_str = to_readable(input_field, low_entropy)[0]
+    else:
+        sample = gen.sample(51, SOS, 1).transpose(1,0)
+        ltr_str = to_readable(input_field, sample)[0]
+        le_str = ''
+
+    if args.log:
+        experiment.log_metrics(to_comet(train_log, prefix='train_'), step=epoch)
+        experiment.log_metrics(to_comet(valid_log, prefix='valid_'), step=epoch)
+        experiment.log_other('left to right sample %d' % epoch, ltr_str)
+        experiment.log_other('low entropy sample %d' % epoch,   le_str)
+
+    curr_valid_loss = torch.stack(valid_log['nll']).mean().item()
+    if curr_valid_loss > best_valid:
+        lr /= 2.
+        for pg in optimizer_gen.param_groups: pg['lr'] = lr
+        print('\n reducing lr to {} \n'.format(lr))
+        experiment.log_metric('lr', lr, step=epoch)
+    else:
+        best_valid = curr_valid_loss
+        if lr < 1e-10 : sys.exit()
