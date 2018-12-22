@@ -13,13 +13,13 @@ Code taken from http://nlp.seas.harvard.edu/2018/04/03/attention.html
 '''
 
 
-class EncoderDecoder(nn.Module):
+class Model(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many 
     other models.
     """
     def __init__(self, decoder, inp_embed, generator, pos_embed):
-        super(EncoderDecoder, self).__init__()
+        super(Model, self).__init__()
         # self.encoder = encoder
         self.decoder = decoder
         self.inp_embed = inp_embed
@@ -31,9 +31,10 @@ class EncoderDecoder(nn.Module):
         return self.generator(self.decode(inp, inp_mask, target_pos))
     
     def decode(self, inp, inp_mask, target_pos):
-        inp = self.inp_embed(inp)
+        inp = self.inp_embed(inp) if 'Long' in str(inp.type()) else inp
         if target_pos is not None:
-            target_pos = self.pos_embed(inp, pos_only=True, trg_pos=target_pos)
+            if 'Long' in str(target_pos.type()):
+                target_pos = self.pos_embed(inp, pos_only=True, trg_pos=target_pos)
         return self.decoder(inp, inp_mask, target_pos)
 
 
@@ -216,6 +217,60 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+def make_vae(tgt_vocab, N=6, z_dim=64, d_model=512, d_ff=2048, h=8, dropout=0.1):
+    "Helper: Construct a model from hyperparameters."
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(h, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    position = PositionalEncoding(d_model, dropout)
+    
+    class VAE(nn.Module):
+        def __init__(self):
+            super(VAE, self).__init__()
+            
+            self.enc = Model(
+                Decoder(DecoderLayer(d_model, c(attn), c(ff), dropout), N),
+                nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
+                nn.Linear(d_model, z_dim), None)
+
+            self.dec = Model(
+                Decoder(DecoderLayer(d_model, c(attn), c(ff), dropout), N),
+                nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
+                Generator(d_model, tgt_vocab), c(position))
+            
+            self.z_to_h = nn.Linear(z_dim, d_model)
+
+            # tie weights
+            self.enc.inp_embed.weight = self.dec.generator.proj.weight
+
+        def forward(self, x, tgt_mask, target_pos=None):
+            # source mask only masks the padding 
+            src_mask = x.unsqueeze(-1).expand_as(tgt_mask) != 1  # pad tokens
+            src_mask = (src_mask + src_mask.transpose(2,1)) == 2 # make it square
+            z = self.enc(x, src_mask)
+            # we sum out the sequence axis to get a single z vector
+            z = z.sum(dim=1)
+
+            # reparam trick
+            # TODO
+
+            h = self.z_to_h(z)
+
+            # we will add h as a token in each sentence, and let the model cond. on h
+            h = h.unsqueeze(1)
+            x = self.enc.inp_embed(x)
+            x = torch.cat([h, x], dim=1)
+            tgt_mask = torch.cat([torch.ones_like(tgt_mask[:, :, [0]]),  tgt_mask], dim=2)
+            tgt_mask = torch.cat([torch.zeros_like(tgt_mask[:, [0], :]), tgt_mask], dim=1)
+         
+            if target_pos is not None:
+                target_pos = self.dec.pos_embed(x, pos_only=True, trg_pos=target_pos)
+                target_pos = torch.cat([torch.zeros_like(target_pos[:, [0], :]), target_pos], dim=1)
+         
+            out = self.dec(x, tgt_mask, target_pos)
+            return out[:, 1:, :].contiguous()
+            
+    return VAE()     
 
 def make_model(tgt_vocab, N=6, 
                d_model=512, d_ff=2048, h=8, dropout=0.1):
@@ -224,7 +279,7 @@ def make_model(tgt_vocab, N=6,
     attn = MultiHeadedAttention(h, d_model)
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
-    model = EncoderDecoder(
+    model = Model(
         Decoder(DecoderLayer(d_model, c(attn), 
                              c(ff), dropout), N),
         nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
@@ -244,6 +299,7 @@ def make_std_mask(tgt, pad):
     tgt_mask = tgt_mask & Variable(
         subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data))
     return tgt_mask
+
 
 # Layers
 # ------------------------------------------------------------------------------------

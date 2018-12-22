@@ -1,5 +1,6 @@
 import comet_ml
 import os
+import sys
 import pdb
 import torch
 import numpy as np
@@ -12,7 +13,7 @@ import matplotlib.pyplot as plti
 from transformer import * 
 from models      import * 
 from utils       import * 
-from custom_ds   import *
+from data        import * 
 from args        import * 
 
 # ----------------------------------------------------------------------------------------------
@@ -32,18 +33,26 @@ if args.log:
                             workspace="pclucas14")
     experiment.log_parameters(vars(args))
 
-input_field, train_iter, val_iter, test_iter = load_data(path=args.data_dir, batch_size=args.batch_size)
-iterators = {'train': train_iter, 'valid': val_iter, 'test': test_iter}
+# dataset creation
+dataset_train, word_dict = tokenize(os.path.join(args.data_dir, 'train.txt'), \
+        train=True, dataset=args.data_dir)
+dataset_valid,  word_dict = tokenize(os.path.join(args.data_dir, 'valid.txt'), train=False, \
+        word_dict=word_dict, dataset=args.data_dir)
+dataset_test,  word_dict = tokenize(os.path.join(args.data_dir, 'test.txt'), train=False, \
+        word_dict=word_dict, dataset=args.data_dir)
+args.vocab_size = len(word_dict) 
 
-VOCAB = input_field.vocab.stoi
-VOCAB_SIZE, PAD, SOS = len(VOCAB.keys()), VOCAB['<pad>'], VOCAB['<sos>']
+datasets  = {'train':dataset_train, 'valid':dataset_valid, 'test':dataset_test}
+iterators = {key : DataLoader(ds, args, word_dict, order=args.masking) for (key, ds) in datasets.items()}
+
 best_valid = 1e10
+SOS, EOS, PAD = [word_dict.word2idx[x] for x in ['<sos>', '<eos>', '<pad>']]
 
 # create model and ship to GPU
 if args.model == 'transformer':
-    gen = make_model(VOCAB_SIZE, N=8, h=args.n_heads).cuda()
+    gen = make_model(args.vocab_size, N=args.n_layers, h=args.n_heads, dropout=0.05, d_ff=2048).cuda()
 else:
-    gen = RNNModel(args.model, VOCAB_SIZE, 650, 650, 650, 2).cuda()
+    gen = RNNModel(args.model, args.vocab_size, 650, 650, 650, 1).cuda()
 
 lr = args.lr
 optimizer_gen = locate('torch.optim.%s.' % args.optim)(gen.parameters(), lr=lr)
@@ -63,38 +72,43 @@ def full_epoch(epoch_no, split, masking):
 
     # Training loop
     for i, minibatch in enumerate(loader):
-        text = minibatch.text.cuda()
-        input = text
+        if args.mode == 'RM': 
+            input, masks, orders, target_pos = minibatch
+        else:
+            raise NotImplementedError
 
         if args.model == 'transformer':
-            lens = (text != 1).sum(dim=1).byte().cpu().data.numpy()
-            masks, orders, tt, _  = \
-                [torch.from_numpy(x).long().cuda() 
-                        for x in 
-                 build_ar_masks(lens, order=masking)]
-            
             offset = (torch.arange(orders.size(0)) * (orders.size(1))).unsqueeze(1).long().cuda()
-            new_order = torch.take(input,  offset + tt)
+            total = (offset + target_pos).clamp_(min=0)
+            # import pdb; pdb.set_trace()
+            assert total.max() < input.numel(), pdb.set_trace()
+            new_order = torch.take(input,  total) #offset + target_pos.clamp(min=0))
             target = new_order
-
+            
             # one token per sentence does not have a target anymore, here is the mask to mask it out
-            mask_eos = tt   != -1 # -1 was used to denote the target of the last token
+            mask_eos = input != EOS
             
             # TODO: clean masking arg handling
             if args.mask_pad_tokens:
-                mask_pad = text != PAD
+                mask_pad = input != PAD
                 mask = torch.min(mask_eos, mask_pad)
             else:
                 mask = mask_eos
+        
+            # turn -1s into 0s. They will be masked out during loss calculation
+            target_pos = target_pos.clamp(min=0)
             
-            tt = tt.clamp(min=0) # turn -1s into 0s. They will be masked out during loss calculation
-             
             # TODO: add some target information
-            logits = gen(input, masks, target_pos=tt if masking=='random' else None) 
+            assert target_pos.min() >= 0, pdb.set_trace()
+            logits = gen(input, masks, target_pos=target_pos if masking=='random' or True else None) 
         
         else:
             # TODO: make LSTM implementation batch first
+            # reverse input
+            #idx = torch.cuda.LongTensor([i for i in range(input.size(1)-1, -1, -1)])
+            #input = input.index_select(1, idx)
             input = input.transpose(1,0).contiguous()
+            
             input, target = input[:-1], input[1:]
             logits = gen(input)[0]
             mask = target != PAD if args.mask_pad_tokens else torch.ones_like(target)
@@ -136,33 +150,34 @@ for epoch in range(args.epochs):
         for key, value in valid_log.items():
             print_scalar('valid/%s' % key, value, epoch)
         print('')
-
+    
     if args.model == 'transformer':
         # left to right sampling
         left_to_right = greedy_decode(gen, 51, start_symbol=SOS)
-        ltr_str = to_readable(input_field, left_to_right)[0]
+        ltr_str = word_dict.to_readable(left_to_right)[0]
         print('left to right : %s' % ltr_str)
 
         # low entropy sampling
-        low_entropy = low_entropy_decoding(gen, 51, SOS, PAD)
-        le_str = to_readable(input_field, low_entropy)[0]
+        #low_entropy = low_entropy_decoding(gen, 51, SOS, PAD)
+        le_str = ''#to_readable(input_field, low_entropy)[0]
     else:
         sample = gen.sample(51, SOS, 1).transpose(1,0)
-        ltr_str = to_readable(input_field, sample)[0]
+        ltr_str = word_dict.to_readable(left_to_right)[0]
+        print('left to right : %s' % ltr_str)
         le_str = ''
 
     if args.log:
         experiment.log_metrics(to_comet(train_log, prefix='train_'), step=epoch)
         experiment.log_metrics(to_comet(valid_log, prefix='valid_'), step=epoch)
-        experiment.log_other('left to right sample %d' % epoch, ltr_str)
-        experiment.log_other('low entropy sample %d' % epoch,   le_str)
+        #experiment.log_other('left to right sample %d' % epoch, ltr_str)
+        #experiment.log_other('low entropy sample %d' % epoch,   le_str)
 
     curr_valid_loss = torch.stack(valid_log['nll']).mean().item()
     if curr_valid_loss > best_valid:
-        lr /= 2.
+        lr /= args.lr_div
         for pg in optimizer_gen.param_groups: pg['lr'] = lr
         print('\n reducing lr to {} \n'.format(lr))
-        experiment.log_metric('lr', lr, step=epoch)
+        if args.log: experiment.log_metric('lr', lr, step=epoch)
+        if lr < 1e-10 : sys.exit()
     else:
         best_valid = curr_valid_loss
-        if lr < 1e-10 : sys.exit()
