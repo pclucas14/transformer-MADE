@@ -158,8 +158,9 @@ for epoch in range(args.epochs):
         print('left to right : %s' % ltr_str)
 
         # low entropy sampling
-        #low_entropy = low_entropy_decoding(gen, 51, SOS, PAD)
-        le_str = ''#to_readable(input_field, low_entropy)[0]
+        low_entropy = low_entropy_decoding(gen, 51, SOS, PAD)
+        le_str = word_dict.to_readable(low_entropy)[0]
+        print('low entropy : %s' % le_str)
     else:
         sample = gen.sample(51, SOS, 1).transpose(1,0)
         ltr_str = word_dict.to_readable(left_to_right)[0]
