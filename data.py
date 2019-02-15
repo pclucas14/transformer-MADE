@@ -6,7 +6,9 @@ import random
 import threading
 import torchtext
 import numpy as np 
+import multiprocessing
 import _pickle as pickle
+
 
 # -----------------------------------------------------------------------------------------------
 # Data Preprocessing 
@@ -176,7 +178,7 @@ def build_ar_masks(lens, order='random', verbose=False):
         target_words = []
         target_pos   = []
         tf_bin_pos   = [] # teacher forced positions
-
+        
         for j, row in enumerate(mask[:len_-1]):
             # find position of x_{t==j} in the ordering
             index = np.where(arr == j)[0][0]
@@ -204,7 +206,11 @@ def build_ar_masks(lens, order='random', verbose=False):
 
                 # we iterate over the row to find the bins, and the candidate tokens
                 # for the bin index that will be teacher forced.
-                for k in range(1, len_):  
+                for k in range(1, len_): 
+                    if k == target_value:
+                        target_bin = curr_ind
+            
+                    # the self-loop has not been added yet, hence the k == j 
                     if row[k] == 1 or k == j:
                         curr_ind += 1
                         if target_bin is None:
@@ -217,9 +223,6 @@ def build_ar_masks(lens, order='random', verbose=False):
                         if not target_pos_found:
                             pos_in_target_bin += [k]
 
-                    if k == target_value:
-                        target_bin = curr_ind
-            
             # since <eos> is always last, we let it condition on all tokens
             mask[len_-1] = np.ones_like(mask[len_-1])
             # we add np.eye() later on
@@ -269,7 +272,17 @@ def build_ar_masks(lens, order='random', verbose=False):
             print(mask)
             print('\n\n')
 
-    masks, orders, targets = [np.stack(x) for x in [masks, orders, targets]]
+    # `tfs_bin_pos` has arrays of uneven lengths. Let's pad them up
+    padding = np.zeros((len(tfs_bin_pos), max_len))
+    for i in range(len(tfs_bin_pos)):
+        row = padding[i]
+        for j, elem in enumerate(tfs_bin_pos[i]):
+            row[j] += elem
+
+    tfs_bin_pos = padding
+
+    masks, orders, targets, tfs_bin_pos = \
+            [np.stack(x) for x in [masks, orders, targets, tfs_bin_pos]]
 
     return masks,           orders,       targets,\
            targets_words,   targets_pos,  tfs_bin_pos
@@ -322,10 +335,6 @@ def build_target_dists(data, target_words, target_bins, args):
         bins_prob[i, seq_len_m_1] = 0.
         bins_prob[i, seq_len_m_1, -1] = 1.
 
-    if args.cuda: 
-        words_prob = words_prob.cuda()
-        bins_prob  = bins_prob.cuda()
-
     # all probs are calculated. wrap things up in a distribution
     words_dist = torch.distributions.Categorical(words_prob.view(-1, args.vocab_size))
     bins_dist  = torch.distributions.Categorical(bins_prob.view(-1, num_pos))
@@ -343,12 +352,10 @@ def fill_seq(input, padded_length, fill_token):
 # Multi-threaded Data Iterators  
 # -----------------------------------------------------------------------------------------------
 
-class DataLoader():
+class TextDataset(torch.utils.data.Dataset):
     def __init__(self, dataset, args, vocab, shuffle=True, order='random'):
         self.ds = dataset
         self.args = args
-        self.next_batch_ready = False
-        self.out = None
         self.vocab = vocab
 
         # Assumes SOS and EOS tokens have already been added.
@@ -371,88 +378,37 @@ class DataLoader():
         self.order       = order
         self.shuffle     = shuffle
 
-        self.reset_indices()
-        self.reset_thread()
+    # Note: it's easier to just consider 1 minibatch as an example, and use "batch_size==1" in the loader
+    def __len__(self):
+        return len(self.minibatches)
 
-
-    def get_next_batch(self):
+    def __getitem__(self, ind):
+    # def get_next_batch(self, queue):
         """ method called by thread to prepare new batch """ 
         args = self.args
-        ind = self.indices.pop()
-        self.num_batches -= 1
-
         minibatch = self.minibatches[ind]
+        
+        # collect lengths to build masks
+        lens = [min(len(x), args.max_seq_len) for x in minibatch]
 
         # longest sentence always at the end of the minibatch
         max_len   = min(args.max_seq_len, len(minibatch[-1]))
         minibatch = [fill_seq(sent, max_len, self.PAD_token) for sent in minibatch]
         data      = torch.LongTensor(minibatch)
         
-        # collect lengths to build masks
-        lens = [min(len(x), args.max_seq_len) for x in minibatch]
 
         # build mask + stuff required to build target
         mask, order, target_i, target_words, target_pos, tf_pos = build_ar_masks(lens, order=self.order)
-        mask, order, target_i = [torch.LongTensor(x) for x in [mask, order, target_i]]
-
-        if args.cuda:
-            data, mask, order, target_i = data.cuda(), mask.cuda(), order.cuda(), target_i.cuda()
+        mask, order, target_i, tf_pos = [torch.LongTensor(x) for x in [mask, order, target_i, tf_pos]]
 
         if args.mode == 'PTW':
             words_dist, bin_dist = build_target_dists(data, target_words, target_pos, args)
-            out = data, words_dist, bin_dist, mask # do we need something else ?
+            out = data, mask, order, tf_pos, bin_dist, words_dist # do we need something else ?
         else:
             out = data, mask, order, target_i
-        
-        self.out = out
-        self.next_batch_ready = True 
 
-
-    def reset_thread(self):
-        """ creates and starts new thread """
-        if self.args.debug:
-            self.get_next_batch()
-        else:
-            self.thread = threading.Thread(target = self.get_next_batch, args=()) 
-            self.thread.start()
-
-
-    def reset_indices(self):
-        """ resets the interation process over the minibatches """ 
-        self.num_batches = len(self.minibatches)
-        self.indices = list(np.arange(self.num_batches))
-
-        if self.shuffle: 
-            random.shuffle(self.indices)
-
-
-    def new_epoch(self):
-        """ handles all the resetting when starting new epoch """ 
-        self.reset_indices()
-        self.reset_thread()
-
-    
-    def __iter__(self):
-        """ iterator method """ 
-        return self
-
-
-    def __next__(self):
-        """ iterator method """ 
-        waited = 0
-        while not self.next_batch_ready : 
-            waited += 1
-            time.sleep(1)
-            print("waited {} seconds for next batch".format(str(waited)))
-
-        out = self.out
-        if self.num_batches <= 0: 
-            self.new_epoch()
-            raise StopIteration
-
-        self.reset_thread()
         return out
-        
+
 
 if __name__ == '__main__':
     class args:
@@ -470,15 +426,3 @@ if __name__ == '__main__':
 
     data = [[ np.random.randint(args.vocab_size) for _ in range(np.random.randint(40, 50)) ] for _ in range(1000) ]
 
-    dataloader = DataLoader(data, args)
-    start = time.time()    
-
-    for i, out in enumerate(dataloader):
-        i += 1
-        print(i)
-        # do some stuff for a second
-        time.sleep(1)
-
-    end = time.time()
-    delta = end - start
-    print('took {:.4f} with threading, and overhead {:.4f}'.format(delta, delta - i))

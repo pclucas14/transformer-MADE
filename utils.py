@@ -21,9 +21,10 @@ def print_scalar(name, value, write_no, end_token=''):
 def to_comet(value_dict, prefix=''):
     out = {}
     for key, value in value_dict.items():
-        if len(value) > 0:
+        if isinstance(value, list) and len(value) > 0:
             value = torch.stack(value).mean().item()
-            out[prefix + key] = value
+        
+        out[prefix + key] = value
 
     return out
 
